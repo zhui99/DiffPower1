@@ -8,7 +8,7 @@ using NetworkDynamics
 using DataFrames
 using CSV
 include("DroopInverter.jl")
-include("NeuralModel.jl")
+# include("NeuralModel.jl")
 
 # DATA_DIR = joinpath(@__DIR__, "ieee39-inverter")
 

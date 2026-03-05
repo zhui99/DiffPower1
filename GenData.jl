@@ -16,12 +16,13 @@ const RESULTS_DIR = joinpath(@__DIR__, "results")
 const NETWORK_NAME = "ieee39-inverter"
 const FEATURE_NAMES = ["omega_dev", "delta", "V", "P", "Q"]
 const FEATURE_COLORS = [:steelblue, :firebrick, :darkgreen, :darkorange, :purple, :brown, :teal, :goldenrod, :magenta, :black]
-const DEFAULT_SCENARIOS = 4
+const DEFAULT_SCENARIOS = 100
 const DEFAULT_SEED = 20260228
 const TSPAN = (0.0, 5.0)
 const DT = 0.01
 const LOAD_EVENT_TIME = 0.80
 const MAX_ATTEMPTS_FACTOR = 4
+const NUM_BUSES = 39
 
 function ensure_dirs!()
     # Keep generated artifacts in stable project-local folders.
@@ -70,7 +71,7 @@ function event_spec(rng::AbstractRNG, bus_df::DataFrame; forced_event_type=nothi
 
     load_buses = bus_df[(bus_df.bus_type .== "PQ") .& (bus_df.has_load .== true), :bus]
     bus = rand(rng, load_buses)
-    dP = clamp(0.35 * randn(rng), -0.8, 0.8)
+    dP = clamp(0.35 * randn(rng), -1, 1)
     dQ = 0.0
     return (; event_type="load_step", target=bus, delta=(dP, dQ), fault=(0.0, 0.0))
 end
@@ -114,6 +115,26 @@ function extract_tensor(nw, sol, sample_times, index_map)
     return data
 end
 
+function flatten_tensor(tensor::Array{Float32, 3})
+    # Flatten (feature, bus, time) -> (feature*bus, time) with bus-major ordering.
+    nfeature, nbus, nt = size(tensor)
+    flat = Array{Float32}(undef, nfeature * nbus, nt)
+    for k in 1:nt
+        flat[:, k] = vec(@view tensor[:, :, k])
+    end
+    return flat
+end
+
+function unflatten_tensor(flat::Array{Float32, 2}, nfeature::Int, nbus::Int)
+    # Restore one scenario from (feature*bus, time) to (feature, bus, time).
+    nt = size(flat, 2)
+    tensor = Array{Float32}(undef, nfeature, nbus, nt)
+    for k in 1:nt
+        tensor[:, :, k] = reshape(@view(flat[:, k]), nfeature, nbus)
+    end
+    return tensor
+end
+
 function run_scenario(rng::AbstractRNG, bus_df::DataFrame, sample_times; forced_event_type=nothing)
     # Build a fresh network for each rollout so callbacks do not leak across scenarios.
     nw = get_IEEE39_base(NETWORK_NAME)
@@ -131,10 +152,7 @@ function run_scenario(rng::AbstractRNG, bus_df::DataFrame, sample_times; forced_
     prob = ODEProblem(nw, u0, TSPAN)
     sol = solve(
         prob,
-        Rodas5P();
-        abstol=1e-8,
-        reltol=1e-6,
-        maxiters=2_000_000,
+        Rodas4P2();
     )
 
     if !SciMLBase.successful_retcode(sol)
@@ -156,9 +174,9 @@ end
 
 function save_preview(times, tensor, preview_buses; filename="sample_state_trajectories.png", title_prefix="")
     # Save one quick-look plot showing all generator-bus trajectories per feature.
-    fig = Figure(size=(1400, 900))
+    fig = CairoMakie.Figure(size=(1400, 900))
     for i in 1:length(FEATURE_NAMES)
-        ax = Axis(
+        ax = CairoMakie.Axis(
             fig[i, 1];
             xlabel=i == length(FEATURE_NAMES) ? "time (s)" : "",
             ylabel=FEATURE_NAMES[i],
@@ -166,11 +184,12 @@ function save_preview(times, tensor, preview_buses; filename="sample_state_traje
         )
         for (j, bus) in enumerate(preview_buses)
             color = FEATURE_COLORS[mod1(j, length(FEATURE_COLORS))]
-            lines!(ax, times, vec(tensor[i, bus, :]), color=color, linewidth=1.8, label="bus $(bus)")
+            CairoMakie.lines!(ax, times, vec(tensor[i, bus, :]), color=color, linewidth=1.8, label="bus $(bus)")
         end
-        axislegend(ax; position=:rb, nbanks=2, labelsize=10)
+        CairoMakie.axislegend(ax; position=:rb, nbanks=2, labelsize=10)
     end
-    save(joinpath(RESULTS_DIR, filename), fig)
+    CairoMakie.save(joinpath(RESULTS_DIR, filename), fig)
+    return nothing
 end
 
 function save_reference_plots(; seed=DEFAULT_SEED)
@@ -201,40 +220,43 @@ function main()
     times = collect((LOAD_EVENT_TIME + DT):DT:TSPAN[2])
     preview_buses = generator_buses(bus_df)
 
-    tensors = Array{Float32, 3}[]
+    trajectories = Array{Float32, 2}[]
 
     attempts = 0
     max_attempts = max(n_scenarios * MAX_ATTEMPTS_FACTOR, n_scenarios)
-    while length(tensors) < n_scenarios && attempts < max_attempts
+    while length(trajectories) < n_scenarios && attempts < max_attempts
         attempts += 1
         tensor = run_scenario(rng, bus_df, times)
         if isnothing(tensor)
             continue
         end
 
-        push!(tensors, tensor)
+        push!(trajectories, flatten_tensor(tensor))
     end
 
-    if isempty(tensors)
+    if isempty(trajectories)
         error("No successful scenarios were generated.")
     end
-    if length(tensors) < n_scenarios
-        @warn "Generated fewer successful scenarios than requested" requested=n_scenarios generated=length(tensors)
+    if length(trajectories) < n_scenarios
+        @warn "Generated fewer successful scenarios than requested" requested=n_scenarios generated=length(trajectories)
     end
 
-    data = cat(tensors...; dims=4)
-    save_preview(times, tensors[1], preview_buses)
+    data = cat(trajectories...; dims=3)
+    preview_tensor = unflatten_tensor(trajectories[1], length(FEATURE_NAMES), NUM_BUSES)
+    save_preview(times, preview_tensor, preview_buses)
 
     data_path = joinpath(DATA_DIR, "data.jld2")
     preview_path = joinpath(RESULTS_DIR, "sample_state_trajectories.png")
-    @save data_path data times FEATURE_NAMES
+    @save data_path data times FEATURE_NAMES NUM_BUSES
 
-    println("Generated $(size(data, 4)) scenarios with tensor shape $(size(data)).")
+    println("Generated $(size(data, 3)) scenarios with flattened shape $(size(data)) (state_dim, time, scenario).")
     println("Saved dataset to $(data_path).")
     println("Saved preview figure to $(preview_path).")
     println("Stored only post-event trajectories from t >= $(LOAD_EVENT_TIME + DT)s.")
     println("Power source: busbar₊P / busbar₊Q.")
-    println("omega_dev mean/std = $(round(mean(data[1, :, :, :]), digits=6)) / $(round(std(data[1, :, :, :]), digits=6))")
+    first_feature_rows = 1:length(FEATURE_NAMES):(length(FEATURE_NAMES) * NUM_BUSES)
+    omega_values = data[first_feature_rows, :, :]
+    println("omega_dev mean/std = $(round(mean(omega_values), digits=6)) / $(round(std(omega_values), digits=6))")
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

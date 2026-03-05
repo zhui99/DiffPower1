@@ -36,8 +36,7 @@ function derivative_segment_loss(
     truth = sample
     segment_times = Float32[0.0f0, dt]
     x0 = truth[:, :, 1]
-    sensealg = InterpolatingAdjoint(; autojacvec=ZygoteVJP())
-    prediction, _, _ = rollout(model, x0, segment_times, ps, st; graph, sensealg)
+    prediction, _, _ = rollout(model, x0, segment_times, ps, st; graph, project_manifold=true)
 
     truth_next = truth[:, :, 2]
     pred_next = prediction[:, :, 2]
@@ -52,7 +51,8 @@ function derivative_batch_loss(
     batch_graph,
     dt::Float32,
 )
-    return Float32(derivative_segment_loss(ps, model, st, batch_sample, dt; graph=batch_graph))
+    base_loss = derivative_segment_loss(ps, model, st, batch_sample, dt; graph=batch_graph)
+    return base_loss * (model.num_buses * model.feature_dim)
 end
 
 function collate_merged_scenarios(samples, base_graph)
@@ -77,7 +77,7 @@ end
 
 function plot_pretrain_loss(loss_trace; output_path=joinpath(TRAIN_RESULTS_DIR, "pretrain_loss_curve.png"))
     fig = Figure(size=(1000, 500))
-    ax = Axis(fig[1, 1]; xlabel="iteration", ylabel="loss", yscale=log10, title="Pretrain loss")
+    ax = CairoMakie.Axis(fig[1, 1]; xlabel="iteration", ylabel="loss", yscale=log10, title="Pretrain loss")
     if !isempty(loss_trace)
         lines!(ax, 1:length(loss_trace), loss_trace, color=:darkgreen, linewidth=2, label="Pretrain")
         axislegend(ax; position=:rt)
@@ -90,7 +90,7 @@ function compute_normalization_stats(data::Array{Float32, 4})
     x_mean = mean(data; dims=(2, 3, 4))
     x_std = std(data; dims=(2, 3, 4))
     x_std = max.(x_std, 1f-3)
-    return Float32.(x_mean), Float32.(x_std)
+    return x_mean, x_std
 end
 
 function normalize_data(data::Array{Float32, 4}, x_mean::Array{Float32, 4}, x_std::Array{Float32, 4})
@@ -167,7 +167,7 @@ function pretrain_node(;
                 derivative_batch_loss(x, model, st, batch.sample, batch.graph, dt)
             end
             opt_state, flat_ps = Optimisers.update(opt_state, flat_ps, grad[1])
-            push!(epoch_losses, Float32(loss))
+            push!(epoch_losses, loss)
         end
 
         epoch_loss = mean(epoch_losses)

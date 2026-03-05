@@ -1,16 +1,83 @@
 Role: Data Engineer
-Tools: PowerDynamics.jl, NetworkDynamics.jl, JLD2.jl 
-Functional Spec:
-    Environment: 创建 ./data 和 ./results 文件夹。
-    Simulation Base: 加载 IEEE 39-bus 系统(参考 `ieee39.jl`; `ieee39-inverter` 为模型配置文件，不做修改), 利用 SciML 中的 ODE 求解方法 `Rodas5P()` 进行仿真。
-    Scenario Generation: 当前仅保留 `load_step` 故障。
-        Load Step: 随机选取一个 PQ 节点引入有功负荷突变；当前实现中 `dQ = 0`，即只保留有功扰动。
-    Feature Extraction:
-        采样步长固定为 `DT = 0.01s`。
-        仅保存故障发生后的状态轨迹，不再保存故障前稳态段。
-        每个母线统一提取 `\mathbf{x} = [\omega_{dev}, \delta, V, P, Q]`。
-        其中 `P/Q` 直接读取 ODE 结果中的 busbar 量；`delta` 与 `V` 当前由母线电压实部/虚部恢复得到。
-    Data Save:
-        多次进行系统仿真（每次引入不同 `load_step` 场景），将每个母线的状态变化保存至 `data.jld2`。
-        当前数据文件仅保存 `data`、`times` 和 `FEATURE_NAMES`，不再保存 `retcode`、`event_type`、`target` 等场景标签。
-        若某次求解失败或状态提取出现非有限值，应直接丢弃该场景并生成下一个样本。
+Tools: PowerDynamics.jl, NetworkDynamics.jl, DifferentialEquations.jl, JLD2.jl, CairoMakie.jl
+
+Functional Spec (must match current `GenData.jl`):
+
+1. Environment and Entry
+- Script: `GenData.jl`
+- Create folders: `./data`, `./results`
+- CLI:
+  - `julia --project=. GenData.jl`
+  - `julia --project=. GenData.jl <n_scenarios> <seed>`
+- Defaults:
+  - `DEFAULT_SCENARIOS = 100`
+  - `DEFAULT_SEED = 20260228`
+  - `NETWORK_NAME = "ieee39-inverter"`
+
+2. Simulation Base
+- Build IEEE-39 system with `get_IEEE39_base("ieee39-inverter")` from `ieee39.jl`.
+- Initialize from power flow: `initialize_from_pf!(nw)`.
+- Simulate with:
+  - `ODEProblem(nw, u0, (0.0, 5.0))`
+  - solver `Rodas5P()`
+  - `abstol=1e-8`, `reltol=1e-6`, `maxiters=2_000_000`
+
+3. Scenario Policy
+- Only `load_step` is enabled.
+- Disturbance time: `LOAD_EVENT_TIME = 0.80`.
+- Disturbance bus: random from PQ buses with load (`bus_type == "PQ"` and `has_load == true`).
+- Disturbance magnitude:
+  - `dP = clamp(0.35 * randn(rng), -0.8, 0.8)`
+  - `dQ = 0.0`
+- Failed/unstable scenarios are dropped directly:
+  - non-success retcode
+  - any non-finite extracted feature
+- Retry budget:
+  - `max_attempts = max(n_scenarios * 4, n_scenarios)`
+
+4. Feature Extraction
+- Fixed sampling interval: `DT = 0.01`
+- Save only post-event trajectory:
+  - `times = (0.80 + 0.01):0.01:5.0`
+- Per-bus features (feature_dim = 5):
+  - `[omega_dev, delta, V, P, Q]`
+  - `omega_dev = ω - 1.0` (machine/inverter category-specific index)
+  - `delta, V` reconstructed from `busbar₊u_r`, `busbar₊u_i`
+  - `P, Q` read directly from `busbar₊P`, `busbar₊Q`
+
+5. Flattening Rule (critical)
+- Raw one-scenario tensor shape before flatten:
+  - `(feature, bus, time) = (5, 39, T)`
+- Saved one-scenario matrix shape after flatten:
+  - `(state_dim, time) = (195, T)`
+- Flatten implementation:
+  - For each time `k`: `flat[:, k] = vec(tensor[:, :, k])`
+- Therefore flatten order is:
+  - feature index varies fastest, then bus index (Julia column-major behavior).
+
+6. Dataset Save Contract
+- Multi-scenario stacked shape:
+  - `data`: `(state_dim, time, scenario)` i.e. `(195, T, N)`
+- Saved fields in `data/data.jld2`:
+  - `data`
+  - `times`
+  - `FEATURE_NAMES = ["omega_dev","delta","V","P","Q"]`
+  - `NUM_BUSES = 39`
+- Do not store:
+  - `retcode`, `event_type`, `target`, `delta`, `fault`
+
+7. Preview Output
+- Reconstruct first scenario from flattened matrix for visualization.
+- Plot generator buses (10 buses, 30-39) for all 5 features.
+- Save figure:
+  - `results/sample_state_trajectories.png`
+
+8. Reproducibility Checklist
+- Run:
+  - `julia --project=. GenData.jl 100 20260228`
+- Expected log characteristics:
+  - reports flattened shape `(195, T, N)`
+  - confirms post-event only (`t >= 0.81s`)
+  - prints omega statistics
+- Validate JLD2 keys:
+  - `data`, `times`, `FEATURE_NAMES`, `NUM_BUSES`

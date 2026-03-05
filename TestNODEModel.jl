@@ -5,7 +5,7 @@ using Optimisers
 using Random
 using Statistics
 
-include("SimpleGCNModel.jl")
+include("Model.jl")
 
 const TEST_RESULTS_DIR = joinpath(@__DIR__, "results")
 
