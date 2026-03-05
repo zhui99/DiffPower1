@@ -2,3 +2,5 @@ data/
 model/
 results/
 *.log
+AGENTS.md
+SPEC/
