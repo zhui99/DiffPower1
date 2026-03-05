@@ -1,0 +1,3 @@
+[submodule "dev/ManifoldNeuralODEs"]
+	path = dev/ManifoldNeuralODEs
+	url = https://github.com/avik-pal/ManifoldNeuralODEs.jl.git
