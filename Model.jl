@@ -2,8 +2,8 @@ using Lux
 using NNlib
 using Random
 const MODEL_FEATURE_DIM = 5
-const MODEL_EMBED_DIM = 5
-const MODEL_MLP_HIDDEN_DIM = 10
+const MODEL_EMBED_DIM = 3
+const MODEL_MLP_HIDDEN_DIM = 8
 
 struct HeteroBusDynamics{E,M} <: Lux.AbstractLuxLayer
     n_buses::Int
